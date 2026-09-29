@@ -6,8 +6,8 @@ import ChatInterface from "../components/ChatInterface";
 import OutlineModal from "../components/OutlineModal";
 import CitationModal from "../components/CitationModal";
 import { summarizeQueryToTitle } from "../utils/titleSummarizer";
+import { apiGet, apiDelete } from "../utils/apiClient";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 const MAX_DOCS_PER_SESSION = 20;
 const SESSIONS_KEY = "docupulse_sessions";
 const ACTIVE_KEY = "docupulse_active_session";
@@ -24,7 +24,7 @@ function makeSession(name = "New Chat") {
 
 function loadSessions() {
   try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]"); }
-  catch { return []; }
+  catch (e) { return []; }
 }
 
 function saveSessions(sessions) {
@@ -65,11 +65,8 @@ export default function Home() {
   // Fetch backend documents
   const fetchDocuments = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/api/documents`);
-      if (res.ok) {
-        const documents = await res.json();
-        startTransition(() => setAllDocuments(documents));
-      }
+      const documents = await apiGet("/api/documents");
+      startTransition(() => setAllDocuments(documents));
     } catch (e) { console.error("Fetch docs:", e); }
   }, []);
 
@@ -132,18 +129,16 @@ export default function Home() {
 
   const handleDeleteDoc = async (docId) => {
     try {
-      const res = await fetch(`${API_BASE}/api/documents/${docId}`, { method: "DELETE" });
-      if (res.ok) {
-        setAllDocuments((prev) => prev.filter((d) => d.id !== docId));
-        setSessions((prev) => {
-          const next = prev.map((s) => ({
-            ...s,
-            uploadedDocIds: (s.uploadedDocIds || []).filter((id) => id !== docId),
-          }));
-          saveSessions(next);
-          return next;
-        });
-      }
+      await apiDelete(`/api/documents/${docId}`);
+      setAllDocuments((prev) => prev.filter((d) => d.id !== docId));
+      setSessions((prev) => {
+        const next = prev.map((s) => ({
+          ...s,
+          uploadedDocIds: (s.uploadedDocIds || []).filter((id) => id !== docId),
+        }));
+        saveSessions(next);
+        return next;
+      });
     } catch (e) { console.error("Delete doc:", e); }
   };
 

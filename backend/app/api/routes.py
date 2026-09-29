@@ -1,6 +1,8 @@
 import os
 import uuid
+import time
 import asyncio
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from pydantic import BaseModel
@@ -15,6 +17,7 @@ from app.services.llm_service import llm_service
 from app.services.vector_store import vector_store
 
 router = APIRouter(prefix="/api")
+logger = logging.getLogger("api.routes")
 
 OVERVIEW_KEYWORDS = {
     "about", "overview", "summarize", "summary", "summarise", "describe",
@@ -46,18 +49,24 @@ async def upload_pdf(
     computes embeddings, and stores document in PostgreSQL with pgvector.
     Also preserves a copy in the uploads directory.
     """
+    upload_start = time.perf_counter()
+    logger.info("[UPLOAD] Received file: '%s'  content-type=%s", file.filename, file.content_type)
+
     if not file.filename.lower().endswith(".pdf"):
+        logger.warning("[UPLOAD] Rejected non-PDF file: '%s'", file.filename)
         raise HTTPException(
             status_code=400,
             detail=f"Invalid file type for '{file.filename}'. Strictly only PDF (.pdf) files are supported."
         )
 
     file_bytes = await file.read()
+    logger.debug("[UPLOAD] File size: %.2f MB  (%d bytes)", len(file_bytes) / 1024 / 1024, len(file_bytes))
 
     # Server-side size guard (10 MB) — mirrors the parser-level check for an early, clear error
     from app.services.pdf_parser import MAX_FILE_SIZE_BYTES
     size_mb = len(file_bytes) / (1024 * 1024)
     if len(file_bytes) > MAX_FILE_SIZE_BYTES:
+        logger.warning("[UPLOAD] File too large: '%s' (%.1f MB)", file.filename, size_mb)
         raise HTTPException(
             status_code=413,
             detail=(
@@ -75,11 +84,23 @@ async def upload_pdf(
     except Exception as e:
         print(f"Notice: Could not write copy to uploads: {e}")
 
+    logger.info("[UPLOAD] Starting PDF parse for '%s'", file.filename)
     try:
         parsed_doc = PDFParser.parse_pdf(file_bytes, file.filename)
+        logger.info(
+            "[UPLOAD] Parsed '%s' — pages=%d  headings=%d  tables=%d  diagrams=%d  chunks=%d",
+            file.filename,
+            parsed_doc.get("total_pages", 0),
+            parsed_doc.get("total_headings", 0),
+            parsed_doc.get("total_tables", 0),
+            parsed_doc.get("total_diagrams", 0),
+            len(parsed_doc.get("chunks", [])),
+        )
     except PDFValidationError as e:
+        logger.error("[UPLOAD] Validation error for '%s': %s", file.filename, e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.exception("[UPLOAD] Unexpected parse failure for '%s'", file.filename)
         raise HTTPException(status_code=500, detail=f"Failed to parse PDF document: {str(e)}")
 
     doc_id = str(uuid.uuid4())
@@ -112,9 +133,10 @@ async def upload_pdf(
 
     # Extract text from chunks for embedding
     chunk_texts = [c.get("content", "") for c in chunks]
-    
-    # Generate embeddings
+    logger.info("[UPLOAD] Generating embeddings for %d chunks of '%s'", len(chunk_texts), file.filename)
+    embed_start = time.perf_counter()
     embeddings = llm_service.get_batch_embeddings(chunk_texts)
+    logger.info("[UPLOAD] Embeddings done in %.1f s", time.perf_counter() - embed_start)
 
     # Save to database
     try:
@@ -140,9 +162,15 @@ async def upload_pdf(
             embeddings=embeddings
         )
     except Exception as e:
+        logger.exception("[UPLOAD] DB storage failed for '%s': %s", file.filename, e)
         await db.rollback()
         raise HTTPException(status_code=500, detail=f"Database storage failed: {str(e)}")
 
+    total_elapsed = time.perf_counter() - upload_start
+    logger.info(
+        "[UPLOAD] SUCCESS '%s'  doc_id=%s  chunks=%d  total_time=%.1f s",
+        file.filename, doc_id, len(chunks), total_elapsed,
+    )
     return {
         "success": True,
         "message": f"Successfully processed '{file.filename}'",
@@ -222,7 +250,18 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
     augmented with keyword-aware retrieval for diagrams and tables, including
     companion explanatory text chunks from diagram pages.
     """
+    chat_start = time.perf_counter()
+    q_preview = request.question[:80].replace("\n", " ")
+    logger.info(
+        "[CHAT] Incoming query | context=%s  doc_id=%s  question='%s%s'",
+        request.context or "legal",
+        request.doc_id or (str(request.doc_ids) if request.doc_ids else "auto"),
+        q_preview,
+        "..." if len(request.question) > 80 else "",
+    )
+
     if not request.question.strip():
+        logger.warning("[CHAT] Empty question rejected.")
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     # Resolve document ID or list of document IDs
@@ -372,19 +411,34 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
     final_chunks = merged_chunks[:48 if wants_overview else 16]
 
     # Generate answer with citations tailored to selected advisory context
+    logger.info(
+        "[CHAT] Sending %d merged chunks to LLM  (overview=%s, diagrams=%s, tables=%s)",
+        len(final_chunks), wants_overview, wants_diagrams, wants_tables,
+    )
+    llm_start = time.perf_counter()
     response = await llm_service.generate_rag_response(
         question=request.question,
         retrieved_contexts=final_chunks,
         conversation_history=request.history,
         preferred_model=request.model,
-        context_type=request.context or "legal"
+        context_type=request.context or "legal",
     )
+    llm_elapsed = time.perf_counter() - llm_start
+    answer_preview = (response.get("answer") or "")[:120].replace("\n", " ")
+    logger.info(
+        "[CHAT] LLM response in %.1f s  |  citations=%d  |  answer='%s%s'",
+        llm_elapsed,
+        len(response.get("citations", [])),
+        answer_preview,
+        "..." if len(response.get("answer", "")) > 120 else "",
+    )
+    logger.info("[CHAT] Total request time: %.1f s", time.perf_counter() - chat_start)
 
     return {
         "answer": response.get("answer", ""),
         "citations": response.get("citations", []),
         "retrieved_sources": final_chunks,
-        "context": request.context or "legal"
+        "context": request.context or "legal",
     }
 
 

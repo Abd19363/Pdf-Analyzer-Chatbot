@@ -1,4 +1,5 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { apiPost } from "./apiClient";
+
 const MAX_SIZE_MB = 10;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
 
@@ -46,12 +47,8 @@ export async function uploadPdfFile(file, { onUploadSuccess, onNotify, disabled 
   try {
     const formData = new FormData();
     formData.append("file", file);
-    const res = await fetch(`${API_BASE}/api/upload`, { method: "POST", body: formData });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.detail || `Upload failed (${res.status})`);
-    }
-    const data = await res.json();
+    // apiPost handles logging (REQ / RES) automatically via apiClient
+    const data = await apiPost("/api/upload", formData);
     onNotify?.({ type: "success", message: "File uploaded successfully" });
     if (onUploadSuccess) onUploadSuccess(data.document);
     return true;

@@ -3,8 +3,8 @@
 import React, { useState, useRef, useEffect } from "react";
 import { renderMarkdown } from "../utils/markdownRenderer";
 import { uploadPdfFile } from "../utils/uploadPdf";
+import { apiPost } from "../utils/apiClient";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const SUGGESTIONS = [
   { title: "Overview", prompt: "What is this document about? Summarize its purpose and key sections." },
@@ -162,23 +162,14 @@ export default function ChatInterface({
     setIsLoading(true);
 
     try {
-      const res = await fetch(`${API_BASE}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          question: query.trim(),
-          doc_id: activeDoc?.id || null,
-          doc_ids: !activeDoc?.id && sessionDocs.length > 0 ? sessionDocs.map((d) => d.id) : null,
-          history: messages.map((m) => ({ role: m.role, content: m.content })),
-          context: selectedContext,
-        }),
+      // apiPost logs [REQ] and [RES] automatically to the browser console
+      const data = await apiPost("/api/chat", {
+        question: query.trim(),
+        doc_id: activeDoc?.id || null,
+        doc_ids: !activeDoc?.id && sessionDocs.length > 0 ? sessionDocs.map((d) => d.id) : null,
+        history: messages.map((m) => ({ role: m.role, content: m.content })),
+        context: selectedContext,
       });
-
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || `Request failed: ${res.status}`);
-      }
-      const data = await res.json();
       const currentCtx = CONTEXT_OPTIONS.find((c) => c.id === selectedContext);
       onMessagesChange([...updated, {
         role: "assistant",

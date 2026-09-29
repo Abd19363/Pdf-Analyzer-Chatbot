@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
+import { apiPost } from "../utils/apiClient";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 const MAX_SIZE_MB = 10;
 const MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024;
@@ -108,19 +108,10 @@ export default function PdfUploader({ onUploadSuccess, disabled = false, maxDocs
       const formData = new FormData();
       formData.append("file", file);
 
-      const res = await fetch(`${API_BASE}/api/upload`, {
-        method: "POST",
-        body: formData,
-      });
+      // apiPost logs [REQ] / [RES] to the browser console automatically
+      const data = await apiPost("/api/upload", formData);
 
       clearInterval(stepInterval);
-
-      if (!res.ok) {
-        const errorData = await res.json().catch(() => ({}));
-        throw new Error(errorData.detail || `Upload failed with status ${res.status}`);
-      }
-
-      const data = await res.json();
       setCurrentStep(PROCESSING_STEPS.length);
       setSuccessMessage(`✓ Successfully analyzed & indexed "${file.name}"!`);
       if (onUploadSuccess) {
