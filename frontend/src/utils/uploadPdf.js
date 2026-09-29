@@ -12,7 +12,7 @@ export function readPdfMagicBytes(file) {
   });
 }
 
-export async function uploadPdfFile(file, { onUploadSuccess, onNotify, disabled = false, uploadedCount = 0, maxDocs = 20 } = {}) {
+export async function uploadPdfFile(file, { sessionId, onUploadSuccess, onNotify, disabled = false, uploadedCount = 0, maxDocs = 20 } = {}) {
   if (!file) return false;
   if (disabled || uploadedCount >= maxDocs) {
     onNotify?.({ type: "error", message: `Limit reached: Maximum ${maxDocs} PDF files per session.` });
@@ -47,10 +47,11 @@ export async function uploadPdfFile(file, { onUploadSuccess, onNotify, disabled 
   try {
     const formData = new FormData();
     formData.append("file", file);
+    formData.append("session_id", sessionId);
     // apiPost handles logging (REQ / RES) automatically via apiClient
     const data = await apiPost("/api/upload", formData);
     onNotify?.({ type: "success", message: "File uploaded successfully" });
-    if (onUploadSuccess) onUploadSuccess(data.document);
+    if (onUploadSuccess) onUploadSuccess(data.document, sessionId);
     return true;
   } catch (err) {
     onNotify?.({ type: "error", message: `Upload error: ${err.message}` });

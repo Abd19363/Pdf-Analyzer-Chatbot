@@ -1,12 +1,25 @@
 import os
 import io
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import google.generativeai as genai
+import yaml
 from app.config import settings
 
 class LLMService:
     def __init__(self):
         self.api_key = settings.GEMINI_API_KEY
+        self.prompt_config_path = Path(__file__).resolve().parents[2] / "config" / "llm_prompts.yaml"
+        self.prompt_config = None
+        self.prompt_config_error = None
+        try:
+            with self.prompt_config_path.open("r", encoding="utf-8") as config_file:
+                self.prompt_config = yaml.safe_load(config_file)
+            if not isinstance(self.prompt_config, dict):
+                raise ValueError("The YAML root must be a mapping.")
+        except (OSError, yaml.YAMLError, ValueError) as error:
+            self.prompt_config_error = str(error)
+
         if self.api_key:
             genai.configure(api_key=self.api_key)
         self.embedding_models = [
@@ -22,6 +35,63 @@ class LLMService:
             "models/gemini-flash-latest",
             "models/gemini-3.5-flash"
         ]
+
+    def get_context_prompt_config(self, context_type: Optional[str]) -> Dict[str, str]:
+        if self.prompt_config_error:
+            raise ValueError(
+                f"Unable to load LLM prompt configuration from {self.prompt_config_path}: "
+                f"{self.prompt_config_error}"
+            )
+
+        config = self.prompt_config or {}
+        context_key = (context_type or "legal").strip().lower()
+        contexts = config.get("contexts")
+        if not isinstance(contexts, dict) or context_key not in contexts:
+            available = ", ".join(contexts.keys()) if isinstance(contexts, dict) else "none"
+            raise ValueError(
+                f"No LLM prompt configuration exists for context '{context_key}'. "
+                f"Available contexts: {available}."
+            )
+
+        selected = contexts[context_key]
+        shared_instructions = config.get("shared_system_instructions")
+        prompt_template = config.get("user_prompt_template")
+        if (
+            not isinstance(selected, dict)
+            or not isinstance(selected.get("instructions"), str)
+            or not isinstance(shared_instructions, str)
+            or not isinstance(prompt_template, str)
+            or "{question}" not in prompt_template
+            or "{document_context}" not in prompt_template
+        ):
+            raise ValueError(
+                f"The LLM prompt configuration for context '{context_key}' is incomplete."
+            )
+
+        return {
+            "context_key": context_key,
+            "label": selected.get("label", context_key),
+            "instructions": selected["instructions"],
+            "shared_instructions": shared_instructions,
+            "prompt_template": prompt_template,
+        }
+
+    def build_rag_prompts(
+        self,
+        question: str,
+        document_context: str,
+        context_type: Optional[str],
+    ) -> tuple[str, str]:
+        context_config = self.get_context_prompt_config(context_type)
+        system_instruction = (
+            f"{context_config['instructions']}\n\n{context_config['shared_instructions']}"
+        )
+        prompt = (
+            context_config["prompt_template"]
+            .replace("{document_context}", document_context)
+            .replace("{question}", question)
+        )
+        return system_instruction, prompt
 
     def get_embedding(self, text: str, is_query: bool = False) -> List[float]:
         """
@@ -137,10 +207,7 @@ class LLMService:
     ) -> Dict[str, Any]:
         """
         Generates a grounded answer from retrieved chunks with citations.
-        Tailors the system prompt and analytical persona to the selected advisory context:
-        - legal: As a Legal Consultant
-        - healthcare: As a Certified Health Professional
-        - government: As a Government Sector Consultant
+        Loads the prompt instructions for the selected context from YAML.
         """
         if not self.api_key:
             return {
@@ -185,64 +252,11 @@ class LLMService:
 
         context_str = "\n\n".join(context_blocks)
 
-        # Build context-specific system prompt based on user option selection
-        normalized_context = (context_type or "legal").lower().strip()
-
-        if "health" in normalized_context:
-            persona_block = (
-                "You are acting As a Certified Health Professional and clinical documentation expert.\n\n"
-                "HEALTHCARE CONSULTATION DIRECTIVES:\n"
-                "1. Adopt the clinical precision, ethical diligence, and patient-safety mindset of a Certified Health Professional.\n"
-                "2. Interpret clinical data, medical terms, diagnostic thresholds, dosage protocols, patient safety standards, and health guidelines based strictly on the provided document context.\n"
-                "3. Prioritize patient safety, clinical efficacy, and evidence-based standards in every response.\n"
-                "4. When explaining procedures, lab ranges, or contraindications, cite exact page numbers and protocol sections.\n"
-                "5. Render tabular lab results, vital signs, or study data in clean, readable Markdown tables."
-            )
-        elif "gov" in normalized_context:
-            persona_block = (
-                "You are acting As a Government Sector Consultant and public administration advisor.\n\n"
-                "GOVERNMENT SECTOR CONSULTATION DIRECTIVES:\n"
-                "1. Adopt the strategic, regulatory, and public-interest mindset of a senior Government Sector Consultant.\n"
-                "2. Analyze statutory compliance, public accountability, administrative procedures, regulatory frameworks, procurement protocols, and civic impacts.\n"
-                "3. Provide structured policy takeaways, legislative/directive references, and clear breakdowns of agency workflows and public responsibilities.\n"
-                "4. When referencing governmental mandates, directives, or policy codes, cite exact page numbers and section headers.\n"
-                "5. Present organizational hierarchies, public budgets, or regulatory checklists in structured Markdown tables."
-            )
-        else: # Default: legal
-            persona_block = (
-                "You are acting As a Legal Consultant and legal documentation analyst.\n\n"
-                "LEGAL CONSULTATION DIRECTIVES:\n"
-                "1. Adopt the rigorous analytical scrutiny, objective tone, and formal precision of a senior Legal Consultant.\n"
-                "2. Thoroughly examine contractual terms, statutory covenants, legal obligations, rights, liabilities, indemnities, warranties, and dispute procedures.\n"
-                "3. Identify potential legal ambiguities, compliance risks, or contractual exposures based strictly on the provided context.\n"
-                "4. Reference precise page numbers and sections/clauses (e.g. `[Page 4, Clause 2.1]`) for every legal finding.\n"
-                "5. Structure responses with formal legal clarity, well-defined headings, and structured analysis."
-            )
-
-        system_instruction = (
-            f"{persona_block}\n\n"
-            "GENERAL GROUNDING & CITATION RULES:\n"
-            "1. Ground all answers strictly in the provided document context blocks.\n"
-            "2. Whenever citing information, tables, or diagrams, reference the page number and section (e.g. `[Page 2]` or `[Page 12, Figure 5.1]`).\n"
-            "3. If tabular data is in the context, render clean Markdown tables for clarity.\n"
-            "4. DIAGRAMS, FIGURES & ARCHITECTURES:\n"
-            "   When the user asks about diagrams, figures, circuits, block diagrams, or architectures:\n"
-            "   - Provide a comprehensive, well-structured summarized paragraph for each relevant diagram/figure.\n"
-            "   - Clearly state the figure title/caption and page citation.\n"
-            "   - Detail what the diagram depicts, its role/purpose, key components, inputs, outputs, and system interactions.\n"
-            "5. If information is partially mentioned, explain what is available in the document clearly and constructively.\n"
-            "6. For overview or summary questions, synthesize the provided context thoroughly.\n"
-            "7. When people, students, authors, or contributors appear in the context, identify every distinct individual supported by the document.\n"
-            "8. Maintain a helpful, professional, structured tone with bold key terms and bullet points where appropriate."
+        system_instruction, prompt = self.build_rag_prompts(
+            question=question,
+            document_context=context_str,
+            context_type=context_type,
         )
-
-        prompt = f"""DOCUMENT CONTEXT:
-{context_str}
-
----
-USER QUESTION: {question}
-
-Please provide a detailed, well-structured answer with source citations (e.g., [Page X]):"""
 
         last_error = None
 
@@ -292,10 +306,28 @@ Please provide a detailed, well-structured answer with source citations (e.g., [
                                     if hasattr(p, "text") and p.text
                                 ])
                     if text and text.strip():
+                        # Extract usage tokens if available from Gemini SDK
+                        usage = getattr(response, "usage_metadata", None)
+                        p_tokens = getattr(usage, "prompt_token_count", 0) or 0
+                        c_tokens = getattr(usage, "candidates_token_count", 0) or 0
+                        t_tokens = getattr(usage, "total_token_count", 0) or (p_tokens + c_tokens)
+
+                        # Fallback token estimation (~4 characters per token)
+                        if t_tokens == 0:
+                            full_input = system_instruction + "\n" + prompt
+                            p_tokens = max(1, len(full_input) // 4)
+                            c_tokens = max(1, len(text.strip()) // 4)
+                            t_tokens = p_tokens + c_tokens
+
                         return {
                             "answer": text.strip(),
                             "citations": citations,
-                            "model": model_name
+                            "model": model_name,
+                            "tokens": {
+                                "prompt_tokens": p_tokens,
+                                "completion_tokens": c_tokens,
+                                "total_tokens": t_tokens
+                            }
                         }
             except Exception as e:
                 last_error = e
@@ -310,9 +342,18 @@ Please provide a detailed, well-structured answer with source citations (e.g., [
         else:
             friendly_err = f"Unable to generate response. (API Notice: {err_msg})"
 
+        full_input = system_instruction + "\n" + prompt
+        fallback_p = max(1, len(full_input) // 4)
+        fallback_c = max(1, len(friendly_err) // 4)
+
         return {
             "answer": friendly_err,
-            "citations": citations
+            "citations": citations,
+            "tokens": {
+                "prompt_tokens": fallback_p,
+                "completion_tokens": fallback_c,
+                "total_tokens": fallback_p + fallback_c
+            }
         }
 
     async def summarize_topic(self, query: str) -> Optional[str]:

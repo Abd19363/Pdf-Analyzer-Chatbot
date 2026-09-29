@@ -23,8 +23,15 @@ function makeSession(name = "New Chat") {
 }
 
 function loadSessions() {
-  try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]"); }
-  catch { return []; }
+  try {
+    const raw = JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]");
+    return raw.map((s) => ({
+      ...s,
+      uploadedDocIds: Array.isArray(s.uploadedDocIds) ? s.uploadedDocIds : [],
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function saveSessions(sessions) {
@@ -74,12 +81,11 @@ export default function Home() {
 
   const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
 
-  // Docs that belong to this session. If session has explicitly tracked doc IDs, use them;
-  // otherwise, default to allDocuments so existing documents in database are immediately accessible.
+  // Docs that belong strictly to this session. Each chat has its own files and limit.
   const sessionDocs =
     activeSession?.uploadedDocIds && activeSession.uploadedDocIds.length > 0
       ? allDocuments.filter((d) => activeSession.uploadedDocIds.includes(d.id))
-      : allDocuments;
+      : [];
 
   // Mutate one session
   const patchSession = useCallback((id, patch) => {
@@ -118,11 +124,21 @@ export default function Home() {
   };
 
   /* ── Document callbacks ── */
-  const handleUploadSuccess = (newDoc) => {
+  const handleUploadSuccess = (newDoc, sessionId) => {
     fetchDocuments();
-    if (newDoc?.id && activeSessionId) {
-      patchSession(activeSessionId, {
-        uploadedDocIds: [...(activeSession?.uploadedDocIds || []), newDoc.id],
+    if (newDoc?.id && sessionId) {
+      setSessions((prev) => {
+        const next = prev.map((s) => {
+          if (s.id === sessionId) {
+            const currentIds = s.uploadedDocIds || [];
+            if (!currentIds.includes(newDoc.id)) {
+              return { ...s, uploadedDocIds: [...currentIds, newDoc.id] };
+            }
+          }
+          return s;
+        });
+        saveSessions(next);
+        return next;
       });
     }
   };
@@ -186,6 +202,7 @@ export default function Home() {
         <div className="flex-1 min-w-0 flex flex-col h-screen overflow-hidden">
           <ChatInterface
             key={activeSessionId}
+            sessionId={activeSessionId}
             sessionName={activeSession?.name || "New Chat"}
             messages={activeSession?.messages || []}
             onMessagesChange={handleMessagesChange}

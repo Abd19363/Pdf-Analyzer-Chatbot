@@ -4,14 +4,14 @@ import time
 import asyncio
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, delete
 
 from app.config import settings
 from app.db.session import get_db
-from app.db.models import Document, DocumentChunk
+from app.db.models import Document, DocumentChunk, ApiLog
 from app.services.pdf_parser import PDFParser, PDFValidationError
 from app.services.llm_service import llm_service
 from app.services.vector_store import vector_store
@@ -25,6 +25,7 @@ OVERVIEW_KEYWORDS = {
     "people", "person", "student", "students", "authors", "author", "names",
     "all"
 }
+MAX_DOCS_PER_SESSION = 20
 
 def is_overview_question(question: str) -> bool:
     """Identify questions that require coverage across the whole document."""
@@ -33,6 +34,7 @@ def is_overview_question(question: str) -> bool:
 
 class ChatRequest(BaseModel):
     question: str
+    session_id: Optional[str] = None
     doc_id: Optional[str] = None
     doc_ids: Optional[List[str]] = None
     history: Optional[List[dict]] = None
@@ -42,6 +44,8 @@ class ChatRequest(BaseModel):
 @router.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...),
+    session_id: str = Form(...),
+    http_req: Request = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -51,6 +55,17 @@ async def upload_pdf(
     """
     upload_start = time.perf_counter()
     logger.info("[UPLOAD] Received file: '%s'  content-type=%s", file.filename, file.content_type)
+
+    session_docs_result = await db.execute(select(Document.doc_metadata))
+    session_doc_count = sum(
+        1 for metadata in session_docs_result.scalars().all()
+        if isinstance(metadata, dict) and metadata.get("session_id") == session_id
+    )
+    if session_doc_count >= MAX_DOCS_PER_SESSION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This conversation has reached its limit of {MAX_DOCS_PER_SESSION} PDF files."
+        )
 
     if not file.filename.lower().endswith(".pdf"):
         logger.warning("[UPLOAD] Rejected non-PDF file: '%s'", file.filename)
@@ -151,7 +166,8 @@ async def upload_pdf(
             total_diagrams=parsed_doc.get("total_diagrams", 0),
             doc_metadata={
                 "outline": parsed_doc.get("outline", []),
-                "chunk_count": len(chunks)
+                "chunk_count": len(chunks),
+                "session_id": session_id,
             }
         )
 
@@ -171,6 +187,16 @@ async def upload_pdf(
         "[UPLOAD] SUCCESS '%s'  doc_id=%s  chunks=%d  total_time=%.1f s",
         file.filename, doc_id, len(chunks), total_elapsed,
     )
+
+    if http_req:
+        total_chars = sum(len(c.get("content", "")) for c in chunks)
+        est_tokens = max(1, total_chars // 4)
+        http_req.state.tokens = {
+            "prompt_tokens": est_tokens,
+            "completion_tokens": 0,
+            "total_tokens": est_tokens
+        }
+
     return {
         "success": True,
         "message": f"Successfully processed '{file.filename}'",
@@ -244,7 +270,11 @@ async def delete_document(doc_id: str, db: AsyncSession = Depends(get_db)):
     return {"success": True, "message": "Document deleted successfully"}
 
 @router.post("/chat")
-async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)):
+async def chat_with_pdf(
+    request: ChatRequest,
+    http_req: Request,
+    db: AsyncSession = Depends(get_db)
+):
     """
     Chat endpoint: performs semantic vector search over PostgreSQL chunks,
     augmented with keyword-aware retrieval for diagrams and tables, including
@@ -264,15 +294,56 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
         logger.warning("[CHAT] Empty question rejected.")
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
+    try:
+        llm_service.get_context_prompt_config(request.context)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
     # Resolve document ID or list of document IDs
     effective_doc_id = request.doc_id
     effective_doc_ids = request.doc_ids
-    if not effective_doc_id and not effective_doc_ids:
+
+    if request.session_id and not effective_doc_id and not effective_doc_ids:
+        return {
+            "answer": "No documents are attached to this chat session yet. Please click the paperclip (📎) icon below to attach a PDF document to this chat.",
+            "citations": [],
+            "retrieved_sources": [],
+            "context": request.context or "legal",
+            "session_title": None,
+            "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
+
+    # If this chat session currently has no attached documents, do not query other chats' files
+    if (effective_doc_ids is not None and len(effective_doc_ids) == 0) and not effective_doc_id:
+        return {
+            "answer": "No documents are attached to this chat session yet. Please click the paperclip (📎) icon below to attach a PDF document to this chat.",
+            "citations": [],
+            "retrieved_sources": [],
+            "context": request.context or "legal",
+            "session_title": None,
+            "tokens": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        }
+
+    # Only fall back to the latest document if neither doc_id nor doc_ids was specified at all (e.g. CLI/direct tests)
+    if not effective_doc_id and effective_doc_ids is None:
         stmt = select(Document.id).order_by(Document.created_at.desc()).limit(1)
         res = await db.execute(stmt)
         latest_id = res.scalar_one_or_none()
         if latest_id:
             effective_doc_id = latest_id
+
+    if request.session_id:
+        requested_doc_ids = {effective_doc_id} if effective_doc_id else set(effective_doc_ids or [])
+        if requested_doc_ids:
+            docs_result = await db.execute(
+                select(Document.id, Document.doc_metadata).where(Document.id.in_(requested_doc_ids))
+            )
+            owned_doc_ids = {
+                doc_id for doc_id, metadata in docs_result.all()
+                if isinstance(metadata, dict) and metadata.get("session_id") == request.session_id
+            }
+            if owned_doc_ids != requested_doc_ids:
+                raise HTTPException(status_code=403, detail="A requested document is not attached to this conversation.")
 
     question_lower = request.question.lower()
     wants_overview = is_overview_question(request.question)
@@ -432,6 +503,10 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
         answer_preview,
         "..." if len(response.get("answer", "")) > 120 else "",
     )
+    # Extract token usage and attach to request.state for logging
+    tokens = response.get("tokens", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    http_req.state.tokens = tokens
+
     # If this looks like the first message (no history or empty history), generate a smart semantic title
     session_title = None
     if not request.history:
@@ -443,6 +518,7 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
         "retrieved_sources": final_chunks,
         "context": request.context or "legal",
         "session_title": session_title,
+        "tokens": tokens,
     }
 
 
@@ -450,11 +526,69 @@ class TitleRequest(BaseModel):
     query: str
 
 @router.post("/summarize-title")
-async def summarize_title_endpoint(request: TitleRequest):
+async def summarize_title_endpoint(request: TitleRequest, http_req: Request):
     """
     Summarizes a user query into a concise 3 to 4 word meaningful session title using LLM.
     """
     title = await llm_service.summarize_topic(request.query)
-    return {"title": title}
+    p_tokens = max(1, len(request.query) // 4)
+    c_tokens = max(1, len(title or "") // 4)
+    token_dict = {
+        "prompt_tokens": p_tokens,
+        "completion_tokens": c_tokens,
+        "total_tokens": p_tokens + c_tokens
+    }
+    http_req.state.tokens = token_dict
+    return {"title": title, "tokens": token_dict}
+
+
+@router.get("/logs")
+async def get_api_logs(
+    limit: int = 50,
+    offset: int = 0,
+    endpoint: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Retrieves recorded API logs from the separate database table:
+    tokens, latency, request, response, and metadata.
+    """
+    stmt = select(ApiLog).order_by(ApiLog.created_at.desc())
+    if endpoint:
+        stmt = stmt.where(ApiLog.endpoint.ilike(f"%{endpoint}%"))
+    stmt = stmt.offset(offset).limit(limit)
+    res = await db.execute(stmt)
+    logs = res.scalars().all()
+    return [
+        {
+            "id": log.id,
+            "request_id": log.request_id,
+            "endpoint": log.endpoint,
+            "method": log.method,
+            "status_code": log.status_code,
+            "latency_ms": log.latency_ms,
+            "latency": log.latency,
+            "tokens": log.tokens,
+            "prompt_tokens": log.prompt_tokens,
+            "completion_tokens": log.completion_tokens,
+            "total_tokens": log.total_tokens,
+            "request": log.request,
+            "response": log.response,
+            "client_ip": log.client_ip,
+            "error_message": log.error_message,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+        }
+        for log in logs
+    ]
+
+
+@router.delete("/logs")
+async def clear_api_logs(db: AsyncSession = Depends(get_db)):
+    """
+    Clears all recorded API logs from the database table.
+    """
+    await db.execute(delete(ApiLog))
+    await db.commit()
+    return {"success": True, "message": "All API logs cleared."}
 
 

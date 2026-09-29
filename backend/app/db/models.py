@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, Integer, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import Column, String, Integer, Float, Text, DateTime, ForeignKey, JSON
 from sqlalchemy.orm import declarative_base, relationship
 from pgvector.sqlalchemy import Vector
 
@@ -35,3 +35,32 @@ class DocumentChunk(Base):
     embedding = Column(Vector(768), nullable=True)
 
     document = relationship("Document", back_populates="chunks")
+
+
+class ApiLog(Base):
+    __tablename__ = "api_logs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    request_id = Column(String(50), nullable=True, index=True)
+    endpoint = Column(String(255), nullable=False, index=True)
+    method = Column(String(10), nullable=False, index=True)
+    status_code = Column(Integer, nullable=False, index=True)
+
+    # Latency (in milliseconds)
+    latency = Column(Float, nullable=False)
+    latency_ms = Column(Float, nullable=False)
+
+    # Token logs
+    tokens = Column(Integer, default=0)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
+
+    # Request and response content
+    request = Column(Text, nullable=True)
+    response = Column(Text, nullable=True)
+
+    client_ip = Column(String(50), nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+

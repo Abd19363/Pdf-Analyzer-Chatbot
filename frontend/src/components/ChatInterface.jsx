@@ -17,7 +17,6 @@ const CONTEXT_OPTIONS = [
   {
     id: "legal",
     label: "Legal Help",
-    rolePrompt: "As a Legal Consultant",
     icon: (
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
@@ -27,7 +26,6 @@ const CONTEXT_OPTIONS = [
   {
     id: "healthcare",
     label: "Healthcare",
-    rolePrompt: "As a Certified Health Professional",
     icon: (
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
         <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
@@ -37,7 +35,6 @@ const CONTEXT_OPTIONS = [
   {
     id: "government",
     label: "Government Sector Help",
-    rolePrompt: "As a Government Sector Consultant",
     icon: (
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
         <rect x="2" y="7" width="20" height="14" rx="2" ry="2" />
@@ -97,6 +94,7 @@ function Avatar({ isUser }) {
 }
 
 export default function ChatInterface({
+  sessionId,
   sessionName = "New Chat",
   messages = [],
   onMessagesChange,
@@ -126,6 +124,7 @@ export default function ChatInterface({
     setIsAttachmentUploading(true);
     try {
       await uploadPdfFile(file, {
+        sessionId,
         onUploadSuccess,
         onNotify: (n) => setNotification(n),
         disabled: docLimitReached,
@@ -165,8 +164,9 @@ export default function ChatInterface({
       // apiPost logs [REQ] and [RES] automatically to the browser console
       const data = await apiPost("/api/chat", {
         question: query.trim(),
+        session_id: sessionId,
         doc_id: activeDoc?.id || null,
-        doc_ids: !activeDoc?.id && sessionDocs.length > 0 ? sessionDocs.map((d) => d.id) : null,
+        doc_ids: !activeDoc?.id ? sessionDocs.map((d) => d.id) : null,
         history: messages.map((m) => ({ role: m.role, content: m.content })),
         context: selectedContext,
       });
@@ -176,7 +176,7 @@ export default function ChatInterface({
           role: "assistant",
           content: data.answer,
           citations: data.citations || [],
-          rolePrompt: currentCtx?.rolePrompt || "As an Advisor",
+          rolePrompt: currentCtx?.label || "Assistant",
         }],
         data.session_title || null
       );
