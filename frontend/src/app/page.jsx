@@ -1,0 +1,212 @@
+"use client";
+
+import React, { useState, useEffect, useCallback, startTransition } from "react";
+import SessionSidebar from "../components/SessionSidebar";
+import ChatInterface from "../components/ChatInterface";
+import OutlineModal from "../components/OutlineModal";
+import CitationModal from "../components/CitationModal";
+import { summarizeQueryToTitle } from "../utils/titleSummarizer";
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const MAX_DOCS_PER_SESSION = 20;
+const SESSIONS_KEY = "docupulse_sessions";
+const ACTIVE_KEY = "docupulse_active_session";
+
+function makeSession(name = "New Chat") {
+  return {
+    id: `s_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    name,
+    messages: [],
+    uploadedDocIds: [],
+    createdAt: Date.now(),
+  };
+}
+
+function loadSessions() {
+  try { return JSON.parse(localStorage.getItem(SESSIONS_KEY) || "[]"); }
+  catch { return []; }
+}
+
+function saveSessions(sessions) {
+  localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+}
+
+export default function Home() {
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [allDocuments, setAllDocuments] = useState([]);
+  const [inspectDoc, setInspectDoc] = useState(null);
+  const [selectedCitation, setSelectedCitation] = useState(null);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+
+  // Bootstrap sessions from localStorage
+  useEffect(() => {
+    const stored = loadSessions();
+    if (stored.length === 0) {
+      const first = makeSession("New Chat");
+      startTransition(() => {
+        setSessions([first]);
+        setActiveSessionId(first.id);
+      });
+      saveSessions([first]);
+    } else {
+      startTransition(() => setSessions(stored));
+      const saved = localStorage.getItem(ACTIVE_KEY);
+      const valid = stored.find((s) => s.id === saved);
+      startTransition(() => setActiveSessionId(valid ? saved : stored[stored.length - 1].id));
+    }
+  }, []);
+
+  // Persist active session id
+  useEffect(() => {
+    if (activeSessionId) localStorage.setItem(ACTIVE_KEY, activeSessionId);
+  }, [activeSessionId]);
+
+  // Fetch backend documents
+  const fetchDocuments = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/documents`);
+      if (res.ok) {
+        const documents = await res.json();
+        startTransition(() => setAllDocuments(documents));
+      }
+    } catch (e) { console.error("Fetch docs:", e); }
+  }, []);
+
+  useEffect(() => { fetchDocuments(); }, [fetchDocuments]);
+
+  const activeSession = sessions.find((s) => s.id === activeSessionId) || null;
+
+  // Docs that belong to this session. If session has explicitly tracked doc IDs, use them;
+  // otherwise, default to allDocuments so existing documents in database are immediately accessible.
+  const sessionDocs =
+    activeSession?.uploadedDocIds && activeSession.uploadedDocIds.length > 0
+      ? allDocuments.filter((d) => activeSession.uploadedDocIds.includes(d.id))
+      : allDocuments;
+
+  // Mutate one session
+  const patchSession = useCallback((id, patch) => {
+    setSessions((prev) => {
+      const next = prev.map((s) => (s.id === id ? { ...s, ...patch } : s));
+      saveSessions(next);
+      return next;
+    });
+  }, []);
+
+  /* ── Session CRUD ── */
+  const handleNewSession = () => {
+    const s = makeSession("New Chat");
+    setSessions((prev) => { const n = [...prev, s]; saveSessions(n); return n; });
+    setActiveSessionId(s.id);
+  };
+
+  const handleSelectSession = (id) => {
+    setActiveSessionId(id);
+    setSidebarOpen(false);
+  };
+
+  const handleDeleteSession = (id) => {
+    setSessions((prev) => {
+      const next = prev.filter((s) => s.id !== id);
+      if (next.length === 0) {
+        const fresh = makeSession("New Chat");
+        saveSessions([fresh]);
+        setActiveSessionId(fresh.id);
+        return [fresh];
+      }
+      saveSessions(next);
+      if (activeSessionId === id) setActiveSessionId(next[next.length - 1].id);
+      return next;
+    });
+  };
+
+  /* ── Document callbacks ── */
+  const handleUploadSuccess = (newDoc) => {
+    fetchDocuments();
+    if (newDoc?.id && activeSessionId) {
+      patchSession(activeSessionId, {
+        uploadedDocIds: [...(activeSession?.uploadedDocIds || []), newDoc.id],
+      });
+    }
+  };
+
+  const handleDeleteDoc = async (docId) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/documents/${docId}`, { method: "DELETE" });
+      if (res.ok) {
+        setAllDocuments((prev) => prev.filter((d) => d.id !== docId));
+        setSessions((prev) => {
+          const next = prev.map((s) => ({
+            ...s,
+            uploadedDocIds: (s.uploadedDocIds || []).filter((id) => id !== docId),
+          }));
+          saveSessions(next);
+          return next;
+        });
+      }
+    } catch (e) { console.error("Delete doc:", e); }
+  };
+
+  /* ── Messages ── */
+  const handleMessagesChange = (newMessages) => {
+    if (!activeSessionId) return;
+    const current = sessions.find((s) => s.id === activeSessionId);
+    let sessionName = current?.name || "New Chat";
+    if (sessionName === "New Chat" || sessionName === "New conversation") {
+      const firstUserMsg = newMessages.find((m) => m.role === "user");
+      if (firstUserMsg?.content) {
+        sessionName = summarizeQueryToTitle(firstUserMsg.content);
+      }
+    }
+    patchSession(activeSessionId, { messages: newMessages, name: sessionName });
+  };
+
+  const uploadedCount = activeSession?.uploadedDocIds?.length || 0;
+
+  return (
+    <div className="flex h-screen bg-paper overflow-hidden">
+      {sidebarOpen && (
+        <button
+          type="button"
+          className="fixed inset-0 z-30 bg-ink/25 md:hidden"
+          aria-label="Close sidebar"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+
+      <SessionSidebar
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        onNewSession={handleNewSession}
+        onSelectSession={handleSelectSession}
+        onDeleteSession={handleDeleteSession}
+        open={sidebarOpen}
+        onClose={() => setSidebarOpen(false)}
+      />
+
+      <div className="flex-1 min-w-0 flex flex-col h-screen overflow-hidden">
+        <ChatInterface
+          key={activeSessionId}
+          sessionName={activeSession?.name || "New Chat"}
+          messages={activeSession?.messages || []}
+          onMessagesChange={handleMessagesChange}
+          sessionDocs={sessionDocs}
+          onUploadSuccess={handleUploadSuccess}
+          onDeleteDoc={handleDeleteDoc}
+          onInspectDoc={(doc) => setInspectDoc(doc)}
+          onSelectCitation={(c) => setSelectedCitation(c)}
+          uploadedCount={uploadedCount}
+          maxDocs={MAX_DOCS_PER_SESSION}
+          onOpenSidebar={() => setSidebarOpen(true)}
+        />
+      </div>
+
+      {inspectDoc && (
+        <OutlineModal doc={inspectDoc} onClose={() => setInspectDoc(null)} />
+      )}
+      {selectedCitation && (
+        <CitationModal citation={selectedCitation} onClose={() => setSelectedCitation(null)} />
+      )}
+    </div>
+  );
+}
