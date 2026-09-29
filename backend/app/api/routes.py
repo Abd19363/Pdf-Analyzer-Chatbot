@@ -432,13 +432,29 @@ async def chat_with_pdf(request: ChatRequest, db: AsyncSession = Depends(get_db)
         answer_preview,
         "..." if len(response.get("answer", "")) > 120 else "",
     )
-    logger.info("[CHAT] Total request time: %.1f s", time.perf_counter() - chat_start)
+    # If this looks like the first message (no history or empty history), generate a smart semantic title
+    session_title = None
+    if not request.history:
+        session_title = await llm_service.summarize_topic(request.question)
 
     return {
         "answer": response.get("answer", ""),
         "citations": response.get("citations", []),
         "retrieved_sources": final_chunks,
         "context": request.context or "legal",
+        "session_title": session_title,
     }
+
+
+class TitleRequest(BaseModel):
+    query: str
+
+@router.post("/summarize-title")
+async def summarize_title_endpoint(request: TitleRequest):
+    """
+    Summarizes a user query into a concise 3 to 4 word meaningful session title using LLM.
+    """
+    title = await llm_service.summarize_topic(request.query)
+    return {"title": title}
 
 

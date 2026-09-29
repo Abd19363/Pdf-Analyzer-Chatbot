@@ -171,12 +171,15 @@ export default function ChatInterface({
         context: selectedContext,
       });
       const currentCtx = CONTEXT_OPTIONS.find((c) => c.id === selectedContext);
-      onMessagesChange([...updated, {
-        role: "assistant",
-        content: data.answer,
-        citations: data.citations || [],
-        rolePrompt: currentCtx?.rolePrompt || "As an Advisor",
-      }]);
+      onMessagesChange(
+        [...updated, {
+          role: "assistant",
+          content: data.answer,
+          citations: data.citations || [],
+          rolePrompt: currentCtx?.rolePrompt || "As an Advisor",
+        }],
+        data.session_title || null
+      );
     } catch (err) {
       onMessagesChange([...updated, {
         role: "assistant",

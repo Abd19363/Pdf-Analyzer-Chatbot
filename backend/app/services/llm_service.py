@@ -315,5 +315,38 @@ Please provide a detailed, well-structured answer with source citations (e.g., [
             "citations": citations
         }
 
+    async def summarize_topic(self, query: str) -> Optional[str]:
+        """
+        Generates a smart, concise, and meaningful 3 to 4 word session title from a user query.
+        """
+        if not self.api_key or not query.strip():
+            return None
+
+        prompt = (
+            "Summarize the main topic of the following user question into a concise 3 to 4 word title.\n"
+            "Rules:\n"
+            "- Strictly 3 to 4 words.\n"
+            "- Capture the core subject, legal/technical concepts, or purpose (e.g., 'Illegal Issues in Project', 'Public Safety Risk Analysis', 'Transformer Architecture Comparison').\n"
+            "- Do not include greetings, question words (e.g. 'Can you', 'What is', 'Any'), or punctuation.\n"
+            "- Capitalize Each Word.\n"
+            "- Output ONLY the title text, nothing else.\n\n"
+            f"Question: {query.strip()}\n"
+            "Title:"
+        )
+
+        for model_name in self.chat_models:
+            try:
+                model = genai.GenerativeModel(model_name=model_name)
+                response = await model.generate_content_async(prompt)
+                if response and response.text:
+                    cleaned = response.text.strip().replace('"', '').replace("'", "").replace(".", "")
+                    words = cleaned.split()
+                    if 2 <= len(words) <= 5:
+                        return " ".join(words[:4])
+            except Exception as e:
+                continue
+
+        return None
+
 llm_service = LLMService()
 
